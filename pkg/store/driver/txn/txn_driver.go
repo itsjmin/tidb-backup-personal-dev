@@ -86,6 +86,18 @@ func (txn *tikvTxn) CacheTableInfo(id int64, info *model.TableInfo) {
 	}
 }
 
+// LockKeys acquires pessimistic locks on keysInput.
+//
+// Region routing for the lock RPCs happens inside client-go
+// (txnkv/transaction/pessimistic.go), which groups keys by region using its
+// own view of region membership. INVARIANT: that view must be coherent with
+// the region cache at the moment each lock RPC is dispatched. If a region
+// split lands after the cache is refreshed but before the lock manager
+// re-resolves the key's region, the lock is acquired on the pre-split region
+// and the key itself stays unlocked, which breaks mutual exclusion and can
+// deadlock concurrent transactions. Epoch-not-match handling on the region
+// cache does not, by itself, repair the lock manager's routing.
+// See TestPessimisticLockAcrossRegionSplit.
 func (txn *tikvTxn) LockKeys(ctx context.Context, lockCtx *kv.LockCtx, keysInput ...kv.Key) error {
 	if intest.InTest {
 		txn.isCommitterWorking.Store(true)
@@ -99,6 +111,9 @@ func (txn *tikvTxn) LockKeys(ctx context.Context, lockCtx *kv.LockCtx, keysInput
 	return txn.generateWriteConflictForLockedWithConflict(lockCtx)
 }
 
+// LockKeysFunc is LockKeys with a callback invoked by client-go once the locks
+// are held. The routing coherence invariant documented on LockKeys applies
+// here unchanged.
 func (txn *tikvTxn) LockKeysFunc(ctx context.Context, lockCtx *kv.LockCtx, fn func(), keysInput ...kv.Key) error {
 	if intest.InTest {
 		txn.isCommitterWorking.Store(true)
