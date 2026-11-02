@@ -26,9 +26,14 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/config/kerneltype"
 	"github.com/pingcap/tidb/pkg/errno"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
+	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/testutils"
 )
 
 func TestInvalidReadTemporaryTable(t *testing.T) {
@@ -799,4 +804,59 @@ func TestInnodbLockWaitTimeout(t *testing.T) {
 		require.Less(t, time.Since(start), time.Second*2)
 		tk.MustExec("commit")
 	}
+}
+
+// TestPessimisticLockAcrossRegionSplit exercises the path where a key's
+// region splits after the session's region cache has been populated for that
+// key but before a pessimistic lock request for it is sent, so the lock RPC is
+// first routed to the pre-split region. The lock must still land on the region
+// that actually owns the key: a second session must wait on it, and must
+// acquire it once the first session commits. See the routing coherence
+// invariant documented on (*tikvTxn).LockKeys in pkg/store/driver/txn.
+func TestPessimisticLockAcrossRegionSplit(t *testing.T) {
+	var cluster testutils.Cluster
+	store, dom := testkit.CreateMockStoreAndDomain(t, mockstore.WithClusterInspector(func(c testutils.Cluster) {
+		mockstore.BootstrapWithSingleStore(c)
+		cluster = c
+	}))
+	// Two sessions are required: the second one verifies that the lock taken
+	// by the first is held on the key's post-split region.
+	tk1 := testkit.NewTestKit(t, store)
+	tk2 := testkit.NewTestKit(t, store)
+	tk1.MustExec("use test")
+	tk2.MustExec("use test")
+	tk1.MustExec("create table t (id int primary key, v int)")
+	tk1.MustExec("insert into t values (1, 1), (5, 5), (9, 9)")
+
+	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
+	require.NoError(t, err)
+	splitKey := tablecodec.EncodeRowKeyWithHandle(tbl.Meta().ID, kv.IntHandle(5))
+	if kerneltype.IsNextGen() {
+		splitKey = store.GetCodec().EncodeKey(splitKey)
+	}
+
+	// Populate tk1's region cache for the key with a plain read inside the
+	// pessimistic transaction. No lock is taken yet.
+	tk1.MustExec("begin pessimistic")
+	tk1.MustQuery("select v from t where id = 5").Check(testkit.Rows("5"))
+
+	// Split at the key while tk1's cache still maps it to the old region.
+	oldRegion, _, _, _ := cluster.GetRegionByKey(splitKey)
+	peerID := cluster.AllocID()
+	cluster.Split(oldRegion.GetId(), cluster.AllocID(), splitKey, []uint64{peerID}, peerID)
+	newRegion, _, _, _ := cluster.GetRegionByKey(splitKey)
+	require.NotEqual(t, oldRegion.GetId(), newRegion.GetId())
+
+	// The lock request is first routed against the stale cache entry.
+	tk1.MustExec("select * from t where id = 5 for update")
+
+	// The lock must be held on the key's actual region: tk2 waits on it...
+	tk2.MustExec("set @@innodb_lock_wait_timeout = 1")
+	tk2.MustExec("begin pessimistic")
+	tk2.MustGetErrCode("select * from t where id = 5 for update", errno.ErrLockWaitTimeout)
+
+	// ...and acquires it once tk1 releases it.
+	tk1.MustExec("commit")
+	tk2.MustQuery("select v from t where id = 5 for update").Check(testkit.Rows("5"))
+	tk2.MustExec("commit")
 }
